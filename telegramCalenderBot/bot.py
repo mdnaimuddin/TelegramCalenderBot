@@ -1,70 +1,64 @@
-# Written By:Naimuddin Mohammad
-# Location : Germany
-# Anyone can use it by updating the token and modify as per your choice
-# I am not able to provide any support for any query or feature upgrade.
-
 import os
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime, timedelta
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-import calendar
+import threading
+import time
 import json
-import uuid
-from telegram.constants import ParseMode
-from telegram.helpers import create_deep_linked_url
+import calendar
 
+# Configure your tokens and credentials
+TELEGRAM_BOT_TOKEN = '7790327699:AAHNYT10vHbNkYLy2u17k-XrPm36C4RhC2w'
+GOOGLE_CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar']
+CREDENTIALS_FILE = 'credentials.json'
 
-class TelegramCalendarBot:
-    def __init__(self, token):
-        self.token = token
-        self.meetings = {}
+# Initialize the bot
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+# Store temporary event data
+user_events = {}
+user_states = {}
+
+class CalendarUI:
+    def __init__(self):
+        self.months = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ]
+        self.current_shown_dates = {}
+    
+    def create_calendar(self, year, month):
+        markup = InlineKeyboardMarkup()
         
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle start command and deep linking."""
-        if context.args and len(context.args[0]) > 0:
-            meeting_id = context.args[0]
-            if meeting_id in self.meetings:
-                await self.add_to_calendar(update, context, meeting_id)
-            else:
-                await update.message.reply_text("This meeting invitation is no longer valid.")
-            return
-
-        await update.message.reply_text(
-            "Welcome to Meeting Organizer Bot!\n"
-            "Commands:\n"
-            "/schedule - Schedule a new meeting\n"
-            "/list - List your meetings\n"
-            "/help - Show this help message"
-        )
-
-    async def schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start scheduling process."""
-        now = datetime.now()
-        calendar_markup = self.create_calendar_markup(now.year, now.month)
-        await update.message.reply_text(
-            "Please select a date:",
-            reply_markup=InlineKeyboardMarkup(calendar_markup)
-        )
-
-    def create_calendar_markup(self, year, month):
-        """Create calendar keyboard."""
-        calendar_matrix = calendar.monthcalendar(year, month)
-        markup = []
+        # First row - Month and Year
+        row = [
+            InlineKeyboardButton(
+                "◀️",
+                callback_data=f"previous-month_{year}_{month}"
+            ),
+            InlineKeyboardButton(
+                f"{self.months[month-1]} {year}",
+                callback_data="ignore"
+            ),
+            InlineKeyboardButton(
+                "▶️",
+                callback_data=f"next-month_{year}_{month}"
+            ),
+        ]
+        markup.row(*row)
         
-        # Month and year header
-        header = [InlineKeyboardButton(
-            f"{calendar.month_name[month]} {year}",
-            callback_data="ignore"
-        )]
-        markup.append(header)
-        
-        # Weekday header
+        # Second row - Days of week
         week_days = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-        markup.append([InlineKeyboardButton(day, callback_data="ignore") for day in week_days])
+        row = [InlineKeyboardButton(day, callback_data="ignore") for day in week_days]
+        markup.row(*row)
         
         # Calendar days
-        for week in calendar_matrix:
+        month_calendar = calendar.monthcalendar(year, month)
+        for week in month_calendar:
             row = []
             for day in week:
                 if day == 0:
@@ -72,218 +66,271 @@ class TelegramCalendarBot:
                 else:
                     row.append(InlineKeyboardButton(
                         str(day),
-                        callback_data=f"date_{year}_{month}_{day}"
+                        callback_data=f"select-day_{year}_{month}_{day}"
                     ))
-            markup.append(row)
+            markup.row(*row)
             
         return markup
 
-    async def handle_calendar_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle calendar selection."""
-        query = update.callback_query
-        data = query.data
+    def create_time_selector(self, selected_date):
+        markup = InlineKeyboardMarkup(row_width=4)
+        hours = []
         
-        if data.startswith("date_"):
-            _, year, month, day = data.split("_")
-            context.user_data['meeting_date'] = {
-                'year': int(year),
-                'month': int(month),
-                'day': int(day)
-            }
-            await query.message.reply_text(
-                "Please enter the meeting time in 24-hour format (HH:MM):"
-            )
-            context.user_data['expecting_time'] = True
-            await query.answer()
+        # Create 24-hour selection buttons
+        for hour in range(24):
+            hours.append(InlineKeyboardButton(
+                f"{hour:02d}:00",
+                callback_data=f"time_{selected_date}_{hour}_0"
+            ))
+            hours.append(InlineKeyboardButton(
+                f"{hour:02d}:30",
+                callback_data=f"time_{selected_date}_{hour}_30"
+            ))
+        
+        # Add hours in groups of 4
+        for i in range(0, len(hours), 4):
+            markup.row(*hours[i:i+4])
+            
+        return markup
 
-    async def create_calendar_event(self, title: str, description: str, start_time: datetime, duration_minutes: int = 60):
-        """Create a calendar event message."""
-        end_time = start_time + datetime.timedelta(minutes=duration_minutes)
+class CalendarBot:
+    def __init__(self):
+        self.events_db = {}
+        self.calendar_ui = CalendarUI()
+        self.load_events()
         
-        # Format for Telegram's time representation
-        start_timestamp = int(start_time.timestamp())
-        end_timestamp = int(end_time.timestamp())
-        
-        # Calculate the time for the 30-minute reminder
-        reminder_time = start_time - datetime.timedelta(minutes=30)
-        reminder_timestamp = int(reminder_time.timestamp())
-        
-        # Create calendar event message using Telegram's special format
-        calendar_text = (
-            f"{title}\n"
-            f"📅 <a href='tg://event?startTime={start_timestamp}&"
-            f"endTime={end_timestamp}&title={title}&reminderTime={reminder_timestamp}'>{title}</a>\n\n"
-            f"📝 {description}\n"
-            f"⏰ {start_time.strftime('%Y-%m-%d %H:%M')} - {end_time.strftime('%H:%M')}\n"
-            f"🔔 Reminder set for 30 minutes before"
-        )
-        
-        return calendar_text
+    def load_events(self):
+        try:
+            with open('events.json', 'r') as f:
+                self.events_db = json.load(f)
+        except FileNotFoundError:
+            self.events_db = {}
+    
+    def save_events(self):
+        with open('events.json', 'w') as f:
+            json.dump(self.events_db, f)
 
-    async def add_to_calendar(self, update: Update, context: ContextTypes.DEFAULT_TYPE, meeting_id: str):
-        """Add meeting to user's Telegram calendar."""
-        meeting = self.meetings[meeting_id]
-        user_id = update.effective_user.id
-        
-        if user_id not in meeting['participants']:
-            meeting['participants'].append(user_id)
-            
-            # Create calendar event message
-            calendar_text = await self.create_calendar_event(
-                title=meeting['title'],
-                description=meeting.get('description', 'No description provided'),
-                start_time=meeting['datetime']
-            )
-            
-            # Send calendar event message
-            keyboard = [[InlineKeyboardButton("Add to Calendar", callback_data=f"add_cal_{meeting_id}")]]
-            await update.message.reply_text(
-                calendar_text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.HTML
-            )
-            
-            await update.message.reply_text(
-                "You've been added to the meeting!\n"
-                "Click 'Add to Calendar' to add it to your Telegram calendar with notifications."
-            )
+    def get_google_calendar_service(self):
+        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, GOOGLE_CALENDAR_SCOPES)
+        credentials = flow.run_local_server(port=0)
+        service = build('calendar', 'v3', credentials=credentials)
+        return service
+
+    def create_event(self, user_id, event_data):
+        event_id = str(len(self.events_db.get(str(user_id), [])) + 1)
+        if str(user_id) not in self.events_db:
+            self.events_db[str(user_id)] = {}
+        self.events_db[str(user_id)][event_id] = event_data
+        self.save_events()
+        return event_id
+
+    def add_to_google_calendar(self, event_data):
+        service = self.get_google_calendar_service()
+        event = {
+            'summary': event_data['title'],
+            'description': event_data.get('description', ''),
+            'start': {
+                'dateTime': event_data['start_time'],
+                'timeZone': 'UTC',
+            },
+            'end': {
+                'dateTime': event_data['end_time'],
+                'timeZone': 'UTC',
+            },
+            'reminders': {
+                'useDefault': False,
+                'overrides': [
+                    {'method': 'popup', 'minutes': 30},
+                ],
+            },
+        }
+        event = service.events().insert(calendarId='primary', body=event).execute()
+        return event.get('htmlLink')
+
+calendar_bot = CalendarBot()
+
+def create_main_markup():
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("📅 Add Event", callback_data="add_event"),
+        InlineKeyboardButton("👀 View Events", callback_data="view_events")
+    )
+    markup.row(
+        InlineKeyboardButton("🔄 Sync with Google", callback_data="sync_google"),
+        InlineKeyboardButton("⚙️ Settings", callback_data="settings")
+    )
+    return markup
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(
+        message,
+        "🎉 Welcome to the Calendar Bot!\n\n"
+        "I can help you manage your events and keep track of your schedule.\n"
+        "What would you like to do?",
+        reply_markup=create_main_markup()
+    )
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_query(call):
+    if call.data == "add_event":
+        msg = bot.send_message(call.message.chat.id, "📝 Please enter the event title:")
+        bot.register_next_step_handler(msg, process_title_step)
+    
+    elif call.data == "view_events":
+        show_events(call.message)
+    
+    elif call.data.startswith("previous-month_") or call.data.startswith("next-month_"):
+        year, month = map(int, call.data.split("_")[1:])
+        if call.data.startswith("previous-month_"):
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
         else:
-            await update.message.reply_text("You're already registered for this meeting!")
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages for meeting setup."""
-        if context.user_data.get('expecting_time'):
-            try:
-                time = datetime.strptime(update.message.text, "%H:%M").time()
-                meeting_date = context.user_data['meeting_date']
-                meeting_datetime = datetime(
-                    meeting_date['year'],
-                    meeting_date['month'],
-                    meeting_date['day'],
-                    time.hour,
-                    time.minute,
-                    tzinfo=pytz.UTC
+            month += 1
+            if month == 13:
+                month = 1
+                year += 1
+                
+        bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=calendar_bot.calendar_ui.create_calendar(year, month)
+        )
+    
+    elif call.data.startswith("select-day_"):
+        _, year, month, day = call.data.split("_")
+        selected_date = f"{year}-{month}-{day}"
+        user_states[call.message.chat.id] = {'selected_date': selected_date}
+        
+        bot.edit_message_text(
+            "🕒 Please select the event time:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=calendar_bot.calendar_ui.create_time_selector(selected_date)
+        )
+    
+    elif call.data.startswith("time_"):
+        _, date, hour, minute = call.data.split("_")
+        selected_datetime = f"{date} {hour}:{minute}"
+        user_id = call.message.chat.id
+        
+        if user_id in user_events:
+            start_time = datetime.strptime(selected_datetime, "%Y-%m-%d %H:%M")
+            end_time = start_time + timedelta(hours=1)
+            
+            user_events[user_id].update({
+                'start_time': start_time.isoformat(),
+                'end_time': end_time.isoformat()
+            })
+            
+            event_id = calendar_bot.create_event(user_id, user_events[user_id])
+            
+            markup = InlineKeyboardMarkup()
+            markup.row(
+                InlineKeyboardButton(
+                    "📱 Add to Google Calendar",
+                    callback_data=f"add_to_google_{event_id}"
                 )
-                
-                await update.message.reply_text("Please enter the meeting title:")
-                context.user_data['meeting_datetime'] = meeting_datetime
-                context.user_data['expecting_time'] = False
-                context.user_data['expecting_title'] = True
-                
-            except ValueError:
-                await update.message.reply_text(
-                    "Invalid time format. Please use HH:MM (e.g., 14:30):"
+            )
+            markup.row(
+                InlineKeyboardButton(
+                    "🏠 Return to Main Menu",
+                    callback_data="main_menu"
                 )
-                
-        elif context.user_data.get('expecting_title'):
-            meeting_title = update.message.text
-            meeting_datetime = context.user_data['meeting_datetime']
-            
-            # Create meeting ID and store meeting details
-            meeting_id = str(uuid.uuid4())[:8]
-            self.meetings[meeting_id] = {
-                'title': meeting_title,
-                'datetime': meeting_datetime,
-                'organizer': update.effective_user.id,
-                'participants': [update.effective_user.id],
-                'description': f"Meeting organized by {update.effective_user.first_name}"
-            }
-            
-            # Create calendar event for organizer
-            calendar_text = await self.create_calendar_event(
-                title=meeting_title,
-                description=self.meetings[meeting_id]['description'],
-                start_time=meeting_datetime
             )
             
-            # Get bot username for deep linking
-            bot_username = (await context.bot.get_me()).username
-            invite_link = f"https://t.me/{bot_username}?start={meeting_id}"
-            
-            # Create invite message with calendar event
-            keyboard = [
-                [InlineKeyboardButton("Add to Calendar", callback_data=f"add_cal_{meeting_id}")],
-                [InlineKeyboardButton("Share Meeting", url=invite_link)]
-            ]
-            
-            await update.message.reply_text(
-                f"{calendar_text}\n\n"
-                f"Share this link to invite others:\n{invite_link}",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.HTML
+            bot.edit_message_text(
+                f"✅ Event '{user_events[user_id]['title']}' created successfully!\n"
+                f"📅 Date: {start_time.strftime('%B %d, %Y')}\n"
+                f"🕒 Time: {start_time.strftime('%I:%M %p')}",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup
             )
             
-            context.user_data.clear()
-
-    async def handle_calendar_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle calendar button clicks."""
-        query = update.callback_query
-        data = query.data
+            # Schedule reminder
+            reminder_thread = threading.Thread(
+                target=schedule_reminder,
+                args=(call.message.chat.id, user_events[user_id]['title'], start_time)
+            )
+            reminder_thread.start()
+    
+    elif call.data == "main_menu":
+        bot.edit_message_text(
+            "What would you like to do?",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=create_main_markup()
+        )
+    
+    elif call.data.startswith("add_to_google_"):
+        event_id = call.data.split("_")[-1]
+        user_id = str(call.message.chat.id)
+        event_data = calendar_bot.events_db[user_id][event_id]
         
-        if data.startswith("add_cal_"):
-            meeting_id = data.split("_")[2]
-            meeting = self.meetings[meeting_id]
-            
-            # Create calendar event message with special Telegram format
-            calendar_text = await self.create_calendar_event(
-                title=meeting['title'],
-                description=meeting['description'],
-                start_time=meeting['datetime']
+        try:
+            calendar_link = calendar_bot.add_to_google_calendar(event_data)
+            bot.send_message(
+                call.message.chat.id,
+                f"✅ Event added to Google Calendar!\n"
+                f"🔗 Calendar Link: {calendar_link}",
+                reply_markup=create_main_markup()
             )
-            
-            # Update the message to show it's been added
-            await query.message.edit_text(
-                f"{calendar_text}\n\n✅ Added to your calendar!",
-                parse_mode=ParseMode.HTML
-            )
-            
-            await query.answer("Meeting added to your calendar!")
-
-    async def list_meetings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """List user's meetings."""
-        user_id = update.effective_user.id
-        user_meetings = [
-            (meeting_id, meeting) for meeting_id, meeting in self.meetings.items()
-            if user_id in meeting['participants']
-        ]
-        
-        if not user_meetings:
-            await update.message.reply_text("You have no scheduled meetings.")
-            return
-            
-        for meeting_id, meeting in user_meetings:
-            calendar_text = await self.create_calendar_event(
-                title=meeting['title'],
-                description=meeting['description'],
-                start_time=meeting['datetime']
-            )
-            
-            keyboard = [[InlineKeyboardButton("Add to Calendar", callback_data=f"add_cal_{meeting_id}")]]
-            await update.message.reply_text(
-                calendar_text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.HTML
+        except Exception as e:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ Error adding event to Google Calendar. Please try again.",
+                reply_markup=create_main_markup()
             )
 
-    def run(self):
-        """Run the bot."""
-        application = Application.builder().token(self.token).build()
-        
-        # Add handlers
-        application.add_handler(CommandHandler("start", self.start))
-        application.add_handler(CommandHandler("schedule", self.schedule))
-        application.add_handler(CommandHandler("list", self.list_meetings))
-        application.add_handler(CallbackQueryHandler(self.handle_calendar_button, pattern="^add_cal_"))
-        application.add_handler(CallbackQueryHandler(self.handle_calendar_callback))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        
-        # Start the bot
-        application.run_polling()
+def process_title_step(message):
+    user_id = message.from_user.id
+    user_events[user_id] = {'title': message.text}
+    
+    now = datetime.now()
+    bot.send_message(
+        message.chat.id,
+        "📅 Please select the event date:",
+        reply_markup=calendar_bot.calendar_ui.create_calendar(now.year, now.month)
+    )
 
+def schedule_reminder(chat_id, event_title, event_time):
+    reminder_time = event_time - timedelta(minutes=30)
+    delay = (reminder_time - datetime.now()).total_seconds()
+    
+    if delay > 0:
+        time.sleep(delay)
+        bot.send_message(
+            chat_id,
+            f"⏰ Reminder: Event '{event_title}' starts in 30 minutes!"
+        )
 
-# WRITE YOUR TOKEN FROM TELEGRAM
+def show_events(message):
+    user_id = str(message.chat.id)
+    if user_id not in calendar_bot.events_db or not calendar_bot.events_db[user_id]:
+        bot.send_message(
+            message.chat.id,
+            "📅 You have no events scheduled.",
+            reply_markup=create_main_markup()
+        )
+        return
 
+    events_text = "📋 Your scheduled events:\n\n"
+    for event_id, event in calendar_bot.events_db[user_id].items():
+        start_time = datetime.fromisoformat(event['start_time'])
+        events_text += f"📌 {event['title']}\n"
+        events_text += f"   📅 {start_time.strftime('%B %d, %Y')}\n"
+        events_text += f"   🕒 {start_time.strftime('%I:%M %p')}\n\n"
+    
+    bot.send_message(
+        message.chat.id,
+        events_text,
+        reply_markup=create_main_markup()
+    )
+
+# Start the bot
 if __name__ == "__main__":
-    BOT_TOKEN = "YOUR TOKEN"
-    bot = TelegramCalendarBot(BOT_TOKEN)
-    bot.run()
+    print("🤖 Bot started...")
+    bot.polling(none_stop=True)
